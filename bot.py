@@ -43,9 +43,11 @@ history = deque(maxlen=60)
 last_signal = "HOLD"
 
 # Track signal history over time for percentage breakdown
-# 45s per cycle, 3 hours = 240 readings
-SIGNAL_WINDOW = 240
+# Cycle length is now variable (normal vs backoff), so we track
+# elapsed wall-clock time instead of assuming a fixed 30s per entry.
+SIGNAL_WINDOW = 360
 signal_history = deque(maxlen=SIGNAL_WINDOW)
+signal_history_start_time = time.time()
 
 # Interactive state
 last_update_id = 0
@@ -53,6 +55,13 @@ snoozed_until = 0  # epoch timestamp; periodic updates paused while now < this
 
 # Cache of the most recent price snapshot, so commands/buttons can reply instantly
 latest = {"price": None, "change": None, "signal": "HOLD", "reason": "Building data..."}
+
+# --- Backoff state for price fetching ---
+NORMAL_SLEEP = 30          # seconds between cycles when things are healthy
+FAIL_SLEEP_START = 60      # first backoff sleep after a failure
+FAIL_SLEEP_MAX = 300       # cap backoff at 5 minutes
+consecutive_failures = 0
+current_fail_sleep = FAIL_SLEEP_START
 
 
 def signal_percentages():
@@ -62,7 +71,7 @@ def signal_percentages():
     buy_pct = (signal_history.count("BUY") / total) * 100
     sell_pct = (signal_history.count("SELL") / total) * 100
     hold_pct = (signal_history.count("HOLD") / total) * 100
-    hours_covered = (total * 45) / 3600
+    hours_covered = (time.time() - signal_history_start_time) / 3600
     return buy_pct, sell_pct, hold_pct, hours_covered
 
 
@@ -119,10 +128,14 @@ def build_status_message():
         buy_pct, sell_pct, hold_pct, hours = pct
         msg += (
             "\n\nLast " + str(round(hours, 1)) + "h breakdown:\n"
-            "BUY: " + str(round(buy_pct, 1)) + "%\n"
-            "SELL: " + str(round(sell_pct, 1)) + "%\n"
-            "HOLD: " + str(round(hold_pct, 1)) + "%"
+            "BUY: " + str(round(buy_pct, 2)) + "%\n"
+            "SELL: " + str(round(sell_pct, 2)) + "%\n"
+            "HOLD: " + str(round(hold_pct, 2)) + "%"
         )
+
+    if consecutive_failures > 0:
+        msg += "\n\n⚠️ " + str(consecutive_failures) + " failed price fetch(es) in a row (rate limited?)"
+
     return msg
 
 
@@ -182,17 +195,34 @@ def handle_updates():
 
 
 def get_price():
+    """
+    Returns (price, change, error_label).
+    error_label is None on success, otherwise a short string describing
+    what went wrong (e.g. "429 rate limited", "timeout", "bad response").
+    """
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
             params={"ids": COINGECKO_ID, "vs_currencies": "usd", "include_24hr_change": "true"},
             timeout=10
-        ).json()
-        price = float(r[COINGECKO_ID]["usd"])
-        change = float(r[COINGECKO_ID].get("usd_24h_change", 0))
-        return price, change
-    except:
-        return None, None
+        )
+    except requests.exceptions.Timeout:
+        return None, None, "timeout"
+    except requests.exceptions.RequestException as e:
+        return None, None, "request error: " + str(e)
+
+    if r.status_code == 429:
+        return None, None, "429 rate limited"
+    if r.status_code != 200:
+        return None, None, "HTTP " + str(r.status_code)
+
+    try:
+        data = r.json()
+        price = float(data[COINGECKO_ID]["usd"])
+        change = float(data[COINGECKO_ID].get("usd_24h_change", 0))
+        return price, change, None
+    except (KeyError, ValueError, TypeError) as e:
+        return None, None, "bad response: " + str(e)
 
 
 def ma(arr, n):
@@ -251,8 +281,13 @@ while True:
         # Check for incoming commands/button taps every cycle
         handle_updates()
 
-        price, change = get_price()
+        price, change, err = get_price()
+
         if price:
+            # Success - reset backoff state
+            consecutive_failures = 0
+            current_fail_sleep = FAIL_SLEEP_START
+
             history.append(price)
             m5 = ma(history, 5)
             m10 = ma(history, 10)
@@ -267,7 +302,7 @@ while True:
             latest["reason"] = reason
 
             rtxt = str(round(r, 1)) if r else "..."
-            print(datetime.now().strftime("%H:%M:%S") + " " + NAME + " price=" + str(price) + " signal=" + sig + " rsi=" + rtxt, flush=True)
+            print(datetime.now().strftime("%H:%M:%S") + " " + NAME + " price=" + str(price) + " signal=" + sig + " rsi=" + rtxt + " history_len=" + str(len(history)), flush=True)
 
             if sig != last_signal and sig != "HOLD":
                 label = "BUY ALERT" if sig == "BUY" else "SELL ALERT"
@@ -276,12 +311,29 @@ while True:
                 pct = signal_percentages()
                 if pct:
                     buy_pct, sell_pct, hold_pct, hours = pct
-                    msg += "\n\nLast " + str(round(hours, 1)) + "h breakdown:\nBUY: " + str(round(buy_pct, 1)) + "%\nSELL: " + str(round(sell_pct, 1)) + "%\nHOLD: " + str(round(hold_pct, 1)) + "%"
+                    msg += "\n\nLast " + str(round(hours, 1)) + "h breakdown:\nBUY: " + str(round(buy_pct, 2)) + "%\nSELL: " + str(round(sell_pct, 2)) + "%\nHOLD: " + str(round(hold_pct, 2)) + "%"
 
                 send(msg, reply_markup=refresh_buttons())
             last_signal = sig
+
         else:
-            print("Failed to fetch price", flush=True)
+            # Failure - log the real reason and back off
+            consecutive_failures += 1
+            print(
+                datetime.now().strftime("%H:%M:%S") + " Failed to fetch price - reason: " + str(err) +
+                " (consecutive failures: " + str(consecutive_failures) + ")",
+                flush=True
+            )
+
+            # Notify on the first failure after being healthy, and then
+            # every 10th failure, so you get a heads up without spam.
+            if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                send(
+                    "⚠️ Price fetch failing for " + NAME + "\n"
+                    "Reason: " + str(err) + "\n"
+                    "Consecutive failures: " + str(consecutive_failures) + "\n"
+                    "Backing off to every " + str(current_fail_sleep) + "s until it recovers."
+                )
 
         counter += 1
         if counter >= 20:
@@ -291,5 +343,13 @@ while True:
 
     except Exception as e:
         print("Error: " + str(e), flush=True)
+        err = "loop error"
+        price = None
 
-    time.sleep(45)
+    # Decide how long to sleep based on whether the last fetch succeeded
+    if price:
+        time.sleep(NORMAL_SLEEP)
+    else:
+        time.sleep(current_fail_sleep)
+        # Exponential backoff, capped at FAIL_SLEEP_MAX
+        current_fail_sleep = min(current_fail_sleep * 2, FAIL_SLEEP_MAX)
